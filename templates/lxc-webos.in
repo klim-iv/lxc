@@ -1,0 +1,314 @@
+#!/bin/bash
+
+#
+# lxc: linux Container library
+#
+# WEBOS example, just copy lxc-busybox
+
+am_in_userns() {
+    [ -e /proc/self/uid_map ] || { echo no; return; }
+    [ "$(wc -l /proc/self/uid_map | awk '{ print $1 }')" -eq 1 ] || { echo yes; return; }
+    line=$(awk '{ print $1 " " $2 " " $3 }' /proc/self/uid_map)
+    [ "$line" = "0 0 4294967295" ] && { echo no; return; }
+    echo yes
+}
+
+in_userns=0
+[ $(am_in_userns) = "yes" ] && in_userns=1
+
+install_busybox()
+{
+    rootfs=$1
+    name=$2
+    res=0
+    tree="\
+$rootfs/selinux \
+$rootfs/dev \
+$rootfs/home \
+$rootfs/root \
+$rootfs/etc \
+$rootfs/etc/init.d \
+$rootfs/bin \
+$rootfs/usr/bin \
+$rootfs/sbin \
+$rootfs/share \
+$rootfs/usr/sbin \
+$rootfs/proc \
+$rootfs/sys \
+$rootfs/mnt \
+$rootfs/media \
+$rootfs/tmp \
+$rootfs/var/log \
+$rootfs/usr/share/udhcpc \
+$rootfs/usr/share/fonts \
+$rootfs/dev/pts \
+$rootfs/dev/shm \
+$rootfs/lib \
+$rootfs/usr/lib \
+$rootfs/usr/palm \
+$rootfs/lib64 \
+$rootfs/usr/lib64"
+
+    mkdir -p $tree || return 1
+    chmod 755 $tree || return 1
+
+    cd $rootfs/dev
+    cp -a /dev/* .
+    cd - > /dev/null
+
+    # root user defined
+    cat <<EOF >> $rootfs/etc/passwd
+root:x:0:0:root:/root:/bin/bash
+EOF
+
+    cat <<EOF >> $rootfs/etc/group
+root:x:0:root
+EOF
+
+    # mount everything
+    cat <<EOF >> $rootfs/etc/init.d/rcS
+#!/bin/bash
+/bin/mount -a
+EOF
+
+    # executable
+    chmod 744 $rootfs/etc/init.d/rcS || return 1
+
+    # mount points
+    cat <<EOF >> $rootfs/etc/fstab
+shm   /dev/shm   tmpfs   defaults     0      0
+EOF
+
+    # writable and readable for other
+    chmod 644 $rootfs/etc/fstab || return 1
+
+    # launch rcS first then make a console available
+    # and propose a shell on the tty, the last one is
+    # not needed
+    cat <<EOF >> $rootfs/etc/inittab
+::sysinit:/etc/init.d/rcS
+tty1::respawn:/bin/getty -L tty1 115200 vt100
+console::askfirst:/bin/bash
+EOF
+    # writable and readable for other
+    chmod 644 $rootfs/etc/inittab || return 1
+
+    cat <<EOF >> $rootfs/usr/share/udhcpc/default.script
+#!/bin/bash
+case "\$1" in
+    deconfig)
+        ip addr flush dev \$interface
+        ;;
+
+    renew|bound)
+        # flush all the routes
+        if [ -n "\$router" ]; then
+            ip route del default 2> /dev/null
+        fi
+
+        # check broadcast
+        if [ -n "\$broadcast" ]; then
+            broadcast="broadcast \$broadcast"
+        fi
+
+        # add a new ip address
+        ip addr add \$ip/\$mask \$broadcast dev \$interface
+
+        if [ -n "\$router" ]; then
+            ip route add default via \$router dev \$interface
+        fi
+
+        [ -n "\$domain" ] && echo search \$domain > /etc/resolv.conf
+        for i in \$dns ; do
+            echo nameserver \$i >> /etc/resolv.conf
+        done
+        ;;
+esac
+exit 0
+EOF
+
+    chmod 744 $rootfs/usr/share/udhcpc/default.script
+
+    return $res
+}
+
+configure_busybox()
+{
+    rootfs=$1
+
+    which busybox >/dev/null 2>&1
+
+    if [ $? -ne 0 ]; then
+        echo "busybox executable is not accessible"
+        return 1
+    fi
+
+    cp `which busybox` $rootfs/sbin/init
+
+    # setting passwd for root
+    CHPASSWD_FILE=$rootfs/root/chpasswd.sh
+
+    cat <<EOF >$CHPASSWD_FILE
+echo "setting root password to \"root\""
+
+
+chroot $rootfs chpasswd <<EOFF 2>/dev/null
+root:root
+EOFF
+
+
+if [ \$? -ne 0 ]; then
+    echo "Failed to change root password"
+    exit 1
+fi
+
+umount $rootfs/lib
+
+EOF
+
+    lxc-unshare -s MOUNT -- /bin/bash < $CHPASSWD_FILE
+    rm $CHPASSWD_FILE
+
+    # add ssh functionality if dropbear package available on host
+    which dropbear >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        # copy dropbear binary
+        cp $(which dropbear) $rootfs/usr/sbin
+        if [ $? -ne 0 ]; then
+            echo "Failed to copy dropbear in the rootfs"
+            return 1
+        fi
+
+        # make symlinks to various ssh utilities
+        utils="\
+            $rootfs/usr/bin/dbclient \
+            $rootfs/usr/bin/scp \
+            $rootfs/usr/bin/ssh \
+            $rootfs/usr/sbin/dropbearkey \
+            $rootfs/usr/sbin/dropbearconvert \
+        "
+        echo $utils | xargs -n1 ln -s /usr/sbin/dropbear
+
+        # add necessary config files
+        mkdir $rootfs/etc/dropbear
+        dropbearkey -t rsa -f $rootfs/etc/dropbear/dropbear_rsa_host_key &> /dev/null
+        dropbearkey -t dss -f $rootfs/etc/dropbear/dropbear_dss_host_key &> /dev/null
+
+        echo "'dropbear' ssh utility installed"
+    fi
+
+    return 0
+}
+
+copy_configuration()
+{
+    path=$1
+    rootfs=$2
+    name=$3
+
+grep -q "^lxc.rootfs" $path/config 2>/dev/null || echo "lxc.rootfs = $rootfs" >> $path/config
+cat <<EOF >> $path/config
+lxc.utsname = $name
+lxc.tty = 1
+lxc.cap.drop = sys_module mac_admin mac_override sys_time
+
+# When using LXC with apparmor, uncomment the next line to run unconfined:
+#lxc.aa_profile = unconfined
+EOF
+
+    libdirs="\
+        lib \
+        usr/lib \
+        lib64 \
+        bin \
+        usr/bin \
+        media \
+        share \
+        usr/share/fonts \
+        usr/palm \
+        usr/lib64"
+
+    for dir in $libdirs; do
+        if [ -d "/$dir" ] && [ -d "$rootfs/$dir" ]; then
+            echo "lxc.mount.entry = /$dir $dir none ro,bind 0 0" >> $path/config
+        fi
+    done
+
+    libdirs_rw="\
+        mnt \
+        "
+
+    for dir in $libdirs_rw; do
+        if [ -d "/$dir" ] && [ -d "$rootfs/$dir" ]; then
+            echo "lxc.mount.entry = /$dir $dir none rw,bind 0 0" >> $path/config
+        fi
+    done
+
+    echo "lxc.mount.entry = /sys/kernel/security sys/kernel/security none ro,bind 0 0" >>$path/config
+    echo "lxc.mount.auto = proc:mixed sys" >>$path/config
+}
+
+usage()
+{
+    cat <<EOF
+$1 -h|--help -p|--path=<path>
+EOF
+    return 0
+}
+
+options=$(getopt -o hp:n: -l help,rootfs:,path:,name: -- "$@")
+if [ $? -ne 0 ]; then
+    usage $(basename $0)
+    exit 1
+fi
+eval set -- "$options"
+
+while true
+do
+    case "$1" in
+        -h|--help)      usage $0 && exit 0;;
+        -p|--path)      path=$2; shift 2;;
+        --rootfs)       rootfs=$2; shift 2;;
+        -n|--name)      name=$2; shift 2;;
+        --)             shift 1; break ;;
+        *)              break ;;
+    esac
+done
+
+if [ "$(id -u)" != "0" ]; then
+    echo "This script should be run as 'root'"
+    exit 1
+fi
+
+if [ -z "$path" ]; then
+    echo "'path' parameter is required"
+    exit 1
+fi
+
+# detect rootfs
+config="$path/config"
+if [ -z "$rootfs" ]; then
+    if grep -q '^lxc.rootfs' $config 2>/dev/null ; then
+        rootfs=`grep 'lxc.rootfs =' $config | awk -F= '{ print $2 }'`
+    else
+        rootfs=$path/rootfs
+    fi
+fi
+
+install_busybox $rootfs $name
+if [ $? -ne 0 ]; then
+    echo "failed to install busybox's rootfs"
+    exit 1
+fi
+
+configure_busybox $rootfs
+if [ $? -ne 0 ]; then
+    echo "failed to configure busybox template"
+    exit 1
+fi
+
+copy_configuration $path $rootfs $name
+if [ $? -ne 0 ]; then
+    echo "failed to write configuration file"
+    exit 1
+fi

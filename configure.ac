@@ -524,6 +524,7 @@ AC_CONFIG_FILES([
 	templates/lxc-ubuntu-cloud
 	templates/lxc-opensuse
 	templates/lxc-busybox
+	templates/lxc-webos
 	templates/lxc-fedora
 	templates/lxc-openmandriva
 	templates/lxc-oracle

@@ -10,6 +10,7 @@ templates_SCRIPTS = \
 	lxc-oracle \
 	lxc-altlinux \
 	lxc-busybox \
+	lxc-webos \
 	lxc-sshd \
 	lxc-archlinux \
 	lxc-alpine \
